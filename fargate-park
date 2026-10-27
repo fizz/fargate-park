@@ -1,0 +1,1170 @@
+#!/usr/bin/env bash
+# fargate-park -- park and unpark an ECS/Fargate cluster's services by scaling
+# them to zero, recording the pre-park desired counts in that account's own SSM
+# so unpark restores exactly what was running.
+#
+# Fargate bills for the task reservation rather than for work done, so an idle
+# service at desiredCount=1 costs what a busy one costs. Parking is the cheapest
+# lever on a demo or preview environment, and the thing that makes it safe to do
+# casually is knowing it goes back exactly as it was.
+#
+# State lives in the TARGET account's SSM rather than on the operator's laptop,
+# so whoever unparks does not need whoever parked. eks-park keeps its EKS node
+# counts in SSM for the same reason.
+#
+#   fargate-park status  --cluster C --profile P --region R
+#   fargate-park park    --cluster C --profile P --region R [--only a,b] [--deep]
+#                        [--with-nat] [--release-eip] [--with-alb] [--alb-adopt]
+#                        [--dns-profile A,B] [--no-dns] [--dry-run]
+#
+# --alb-adopt is for a balancer that Terraform manages. Park deletes it as usual,
+# and records that Terraform builds it back. Unpark then builds nothing: it
+# requires the balancer and its listeners to exist already, from a Terraform
+# apply, and adds only what Terraform does not own -- the listener rules the app
+# workflows wrote, and any DNS record not already aimed at the balancer. A
+# balancer that unpark builds gets a new ARN, and Terraform's state still holds
+# the old one, so the next apply would build a second balancer.
+#
+# --deep is --with-nat --release-eip --with-alb together, which is what a full
+# weekend park wants every time. --dns-profile is still given separately because
+# it names accounts rather than switching behaviour on.
+#
+# A --with-alb park that finds no Route53 record aimed at the balancer stops
+# before it changes anything. Nothing recorded means unpark repoints nothing,
+# and the name is left aimed at a deleted balancer. --no-dns says the balancer
+# has no public name and the park may go ahead.
+#   fargate-park unpark  --cluster C --profile P --region R [--alb-only] [--dry-run]
+#
+# --alb-only narrows either direction to the load balancer and leaves services
+# and NAT alone. It is how the load balancer half gets exercised end to end
+# without waking a parked environment, and it is the right park for an
+# environment whose services are already at zero.
+#
+# Unpark takes no flags past the three required ones. Every choice park made --
+# whether it took the NAT, whether it took the load balancer, which profiles hold
+# the DNS zones that point at it -- is written into the SSM blob, so whoever
+# unparks does not have to remember, or even know, how it was parked.
+#
+# Profile and region are required rather than inherited. A stale AWS_REGION in
+# the shell routes calls to the wrong partition and fails as InvalidClientTokenId,
+# which reads like an expired session rather than a routing error.
+set -euo pipefail
+
+ACTION="${1:-}"; shift || true
+CLUSTER=""; PROFILE=""; REGION=""; ONLY=""; DRY=0; WITH_NAT=0; RELEASE_EIP=0
+WITH_ALB=0; DNS_PROFILES=""; ALB_ONLY=0; DEEP=0; NO_DNS=0; ALB_ADOPT=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cluster)  CLUSTER="$2"; shift 2 ;;
+    --profile)  PROFILE="$2"; shift 2 ;;
+    --region)   REGION="$2";  shift 2 ;;
+    --only)     ONLY="$2";    shift 2 ;;
+    --with-nat) WITH_NAT=1; shift ;;
+    --release-eip) RELEASE_EIP=1; shift ;;
+    --with-alb) WITH_ALB=1; shift ;;
+    --alb-only) WITH_ALB=1; ALB_ONLY=1; shift ;;
+    # Everything a full park can give back. Each of the three is separately
+    # destructive, which is why none can default on -- but remembering the right
+    # combination at the end of a Friday is its own failure mode, and forgetting
+    # one silently leaves money running. --deep is the whole set, named once.
+    # --dns-profile stays separate: it carries data (which accounts' zones hold
+    # records aimed at this balancer), and that cannot be guessed.
+    --deep) DEEP=1; WITH_NAT=1; RELEASE_EIP=1; WITH_ALB=1; shift ;;
+    --dns-profile) DNS_PROFILES="$2"; shift 2 ;;
+    --no-dns)   NO_DNS=1; shift ;;
+    --alb-adopt) ALB_ADOPT=1; shift ;;
+    --dry-run)  DRY=1; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+case "$ACTION" in
+  park|unpark|status) ;;
+  *) echo "usage: fargate-park <park|unpark|status> --cluster C --profile P --region R [--only a,b] [--deep | --with-nat --release-eip --with-alb] [--alb-only] [--alb-adopt] [--dns-profile A,B] [--no-dns] [--dry-run]" >&2
+     exit 2 ;;
+esac
+
+if [ "$ALB_ONLY" = 1 ] && [ "$WITH_NAT" = 1 ]; then
+  if [ "$DEEP" = 1 ]; then
+    echo "--deep and --alb-only ask for opposite scopes: --deep is everything," >&2
+    echo "--alb-only is the balancer and nothing else" >&2
+  else
+    echo "--alb-only and --with-nat ask for opposite scopes" >&2
+  fi
+  exit 2
+fi
+
+if [ "$RELEASE_EIP" = 1 ] && [ "$WITH_NAT" != 1 ]; then
+  echo "--release-eip only means anything with --with-nat: the address is held by the NAT" >&2
+  exit 2
+fi
+
+if [ -n "$DNS_PROFILES" ] && [ "$WITH_ALB" != 1 ]; then
+  echo "--dns-profile only means anything with --with-alb: it names the profiles whose" >&2
+  echo "Route53 zones are searched for records aimed at the load balancer" >&2
+  exit 2
+fi
+
+if [ "$NO_DNS" = 1 ] && [ "$WITH_ALB" != 1 ]; then
+  echo "--no-dns only means anything with --with-alb" >&2
+  exit 2
+fi
+
+# Park records the choice, so unpark needs no flag for it.
+if [ "$ALB_ADOPT" = 1 ] && { [ "$ACTION" != park ] || [ "$WITH_ALB" != 1 ]; }; then
+  echo "--alb-adopt is a park flag, and only means anything with --with-alb." >&2
+  echo "Unpark reads the choice from the parked state." >&2
+  exit 2
+fi
+
+if [ -z "$CLUSTER" ] || [ -z "$PROFILE" ] || [ -z "$REGION" ]; then
+  echo "--cluster, --profile and --region are all required" >&2
+  exit 2
+fi
+
+# Most accounts hold their own DNS, so the load balancer's own profile is the
+# right default. A delegated subdomain is the case that is not: when example.com
+# delegates app.example.com to a zone in another account, the apex alias lives
+# there, so pass that account's profile with --dns-profile.
+if [ "$WITH_ALB" -eq 1 ] && [ -z "$DNS_PROFILES" ]; then
+  DNS_PROFILES="$PROFILE"
+fi
+
+# All three, always. Setting only some is not a partial fix, it is no fix:
+# AWS_REGION outranks AWS_DEFAULT_REGION, and the --region flag outranks both.
+export AWS_PROFILE="$PROFILE"
+export AWS_REGION="$REGION"
+export AWS_DEFAULT_REGION="$REGION"
+
+PARAM="/fargate-park/${CLUSTER}"
+# The load balancer lives in its own parameter rather than in the main blob.
+# A Standard SSM parameter caps at 4096 bytes and a handful of listener rules
+# eats most of that on its own, so one merged blob puts the service counts --
+# the thing this tool exists to protect -- one rule away from being unwritable.
+ALB_PARAM="/fargate-park/${CLUSTER}-alb"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+list_services() {
+  aws ecs list-services --cluster "$CLUSTER" --region "$REGION" \
+      --query 'serviceArns[]' --output text \
+    | tr '\t' '\n' | sed 's#.*/##' | grep -v '^$' | sort
+}
+
+describe_services() {
+  aws ecs describe-services --cluster "$CLUSTER" --region "$REGION" --services "$@" \
+    --query 'services[].{service:serviceName,desired:desiredCount,running:runningCount}' \
+    --output json
+}
+
+read_state() {
+  aws ssm get-parameter --name "$PARAM" --region "$REGION" \
+      --query 'Parameter.Value' --output text 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# NAT gateway, opt-in via --with-nat.
+#
+# A NAT gateway bills about $32/month whether or not anything sits behind it, so
+# a parked cluster keeps paying for egress nobody uses. Deleting one is real VPC
+# surgery rather than a scale-to-zero, which is why this is opt-in and never
+# implied by a plain park.
+#
+# The Elastic IP is kept by default. An idle EIP costs about $3.60/month and buys
+# a stable public address, so anything downstream that allowlists the NAT's IP
+# survives a park cycle.
+#
+# --release-eip gives that up for the $3.60. Unpark then allocates a fresh
+# address, which is NOT the one that was there before: an allowlist somewhere
+# else now points at an IP this account no longer holds. Use it on environments
+# nobody allowlists, and check before using it on one that a customer reaches.
+#
+# An address cannot be released while a NAT still holds it, so release waits for
+# the NAT to finish deleting first. That wait is a minute or two, which is why a
+# plain --with-nat park returns faster than one that also releases.
+#
+# Order matters coming back up. Fargate tasks in private subnets reach ecr.api,
+# ecr.dkr and CloudWatch Logs through the NAT, so it must exist and be available
+# BEFORE any service scales. Otherwise tasks cannot pull images and the symptom
+# is a crash loop rather than a missing route.
+# ---------------------------------------------------------------------------
+
+nat_snapshot() {
+  # The NAT to take is the one the selected services route through, not the first
+  # one in the account. An account can hold several environments, each with its
+  # own NAT, and a park of one must not cut another off. The path is service ->
+  # its awsvpc subnets -> each subnet's route table (or the VPC's main table when
+  # the subnet has no explicit association) -> the NAT on its routes.
+  local subnets vpc natids
+  subnets=$(aws ecs describe-services --cluster "$CLUSTER" --region "$REGION" --services "$@" \
+      --query 'services[].networkConfiguration.awsvpcConfiguration.subnets[]' --output text \
+    | tr '\t' '\n' | grep -v -e '^$' -e '^None$' | sort -u || true)
+  if [ -z "$subnets" ]; then
+    echo '{}'
+    return 0
+  fi
+  vpc=$(aws ec2 describe-subnets --region "$REGION" --subnet-ids $subnets \
+      --query 'Subnets[0].VpcId' --output text)
+  aws ec2 describe-route-tables --region "$REGION" --filters Name=vpc-id,Values="$vpc" \
+      --output json > "$TMP/vpc-rtb.json"
+  natids=$(python3 "$HELPER" nats_for_subnets "$TMP/vpc-rtb.json" $subnets)
+  if [ -z "$natids" ]; then
+    echo '{}'
+    return 0
+  fi
+  if [ "$(printf '%s\n' "$natids" | wc -l | tr -d ' ')" -gt 1 ]; then
+    # Recording one and deleting it would strand the services on the other.
+    echo "the selected services route through more than one NAT gateway:" >&2
+    printf '  %s\n' $natids >&2
+    echo "narrow the park with --only, or park without --with-nat" >&2
+    exit 1
+  fi
+  aws ec2 describe-nat-gateways --region "$REGION" --nat-gateway-ids "$natids" \
+      --filter Name=state,Values=available \
+      --query 'NatGateways[0].{id:NatGatewayId,subnet:SubnetId,alloc:NatGatewayAddresses[0].AllocationId,ip:NatGatewayAddresses[0].PublicIp}' \
+      --output json > "$TMP/nat.json" 2>/dev/null || echo 'null' > "$TMP/nat.json"
+  # Every route aimed at this NAT is recorded, not only the services' own, so
+  # unpark restores the whole VPC's egress. A NAT's routes are all in its VPC.
+  aws ec2 describe-route-tables --region "$REGION" --filters Name=vpc-id,Values="$vpc" \
+      --query 'RouteTables[].{rtb:RouteTableId,routes:Routes[?NatGatewayId!=null].[DestinationCidrBlock,NatGatewayId]}' \
+      --output json > "$TMP/rtb.json" 2>/dev/null || echo '[]' > "$TMP/rtb.json"
+  python3 "$HELPER" collect "$TMP/nat.json" "$TMP/rtb.json"
+}
+
+nat_delete() {
+  local nat="$1" alloc="${2:-}"
+  aws ec2 delete-nat-gateway --region "$REGION" --nat-gateway-id "$nat" >/dev/null
+  if [ "$RELEASE_EIP" != 1 ] || [ -z "$alloc" ] || [ "$alloc" = "None" ]; then
+    echo "  deleted NAT $nat, EIP retained"
+    return 0
+  fi
+  # The address stays attached until the gateway is really gone, so releasing
+  # early fails with AuthFailure and leaves the EIP billing anyway.
+  echo "  deleted NAT $nat, waiting for it to clear before releasing $alloc"
+  aws ec2 wait nat-gateway-deleted --region "$REGION" --nat-gateway-ids "$nat" 2>/dev/null || true
+  if aws ec2 release-address --region "$REGION" --allocation-id "$alloc" 2>/dev/null; then
+    echo "  released EIP $alloc — unpark will come back on a different address"
+  else
+    echo "  WARNING: could not release EIP $alloc, it is still billing"
+  fi
+}
+
+nat_restore() {
+  local blob="$1" subnet alloc newid
+  subnet=$(printf '%s' "$blob" | python3 "$HELPER" field subnet)
+  alloc=$(printf '%s' "$blob" | python3 "$HELPER" field alloc)
+
+  # The recorded allocation is gone if this park released it, and would also be
+  # gone if someone released it by hand. Either way ask for a new one rather
+  # than failing: a NAT on a different address beats no NAT at all.
+  if [ -z "$alloc" ] || [ "$alloc" = "None" ] \
+     || ! aws ec2 describe-addresses --region "$REGION" --allocation-ids "$alloc" >/dev/null 2>&1; then
+    alloc=$(aws ec2 allocate-address --region "$REGION" --domain vpc \
+              --query AllocationId --output text)
+    echo "  previous EIP is gone, allocated $alloc"
+    echo "  NOTE: this is a NEW public address; update anything that allowlists it"
+  fi
+
+  newid=$(aws ec2 create-nat-gateway --region "$REGION" \
+            --subnet-id "$subnet" --allocation-id "$alloc" \
+            --query 'NatGateway.NatGatewayId' --output text)
+  echo "  creating NAT $newid in $subnet with $alloc"
+  aws ec2 wait nat-gateway-available --region "$REGION" --nat-gateway-ids "$newid"
+  echo "  NAT $newid available"
+
+  printf '%s' "$blob" | python3 "$HELPER" routes \
+  | while IFS=" " read -r RTB CIDR; do
+      aws ec2 replace-route --region "$REGION" --route-table-id "$RTB" \
+          --destination-cidr-block "$CIDR" --nat-gateway-id "$newid" 2>/dev/null \
+      || aws ec2 create-route --region "$REGION" --route-table-id "$RTB" \
+          --destination-cidr-block "$CIDR" --nat-gateway-id "$newid" >/dev/null
+      echo "  routed $RTB $CIDR to $newid"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Application Load Balancer, opt-in via --with-alb.
+#
+# An idle ALB bills about $16-22/month for existing. There is no scale-to-zero
+# for one, so parking means deleting it and building it back from a recording.
+#
+# What survives the delete, and therefore is not recorded: target groups, their
+# health checks and their registered targets; the security groups and every rule
+# that references them by id; the subnets, route tables and ACM certificates.
+# What dies with it: the load balancer, its listeners, and its rules. Those are
+# what the blob holds.
+#
+# The DNS name does not survive. AWS mints a new one on every create, so any
+# record aimed at the old name is left pointing at a hostname this account no
+# longer owns -- a dangling CNAME, and a subdomain takeover waiting for someone
+# to claim the freed ELB name. So park records those records and deletes them,
+# and unpark recreates them against the new name.
+#
+# Those zones routinely live in a different account from the load balancer:
+# an app's load balancer can sit in a workload account while its zone,
+# app.example.com, sits in a DNS account, delegated from the parent zone.
+# --dns-profile names the profiles whose zones to search, and the list is stored
+# in the blob so unpark needs no flag to find its way back.
+# ---------------------------------------------------------------------------
+
+ALBHELPER="$TMP/alb.py"
+cat > "$ALBHELPER" <<'PYALB'
+import json, sys, datetime
+
+mode = sys.argv[1]
+
+
+def load(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def jsonl(path):
+    out = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+# AWS echoes every rule condition and action back in two shapes: the flat one it
+# accepts on create, and a typed *Config sibling. Storing both doubles the blob
+# for nothing, and the flat shape is the one create-rule wants.
+CONDITION_KEEP = ("Field", "Values", "HostHeaderConfig", "HttpHeaderConfig",
+                  "QueryStringConfig", "HttpRequestMethodConfig", "SourceIpConfig")
+ACTION_DROP = ("ForwardConfig",)
+
+
+def trim_condition(cond):
+    out = {k: v for k, v in cond.items() if k in CONDITION_KEEP and v}
+    # PathPatternConfig/HostHeaderConfig just restate Values for those two fields.
+    if out.get("Field") in ("path-pattern", "host-header") and "Values" in out:
+        out.pop("HostHeaderConfig", None)
+    return out
+
+
+def trim_action(act):
+    out = {k: v for k, v in act.items() if k not in ACTION_DROP}
+    # A single-target forward round-trips as TargetGroupArn; drop the echo only
+    # when it says nothing the flat field does not already say.
+    fwd = act.get("ForwardConfig") or {}
+    groups = fwd.get("TargetGroups") or []
+    if act.get("Type") == "forward" and act.get("TargetGroupArn") and len(groups) <= 1:
+        return out
+    if fwd:
+        out["ForwardConfig"] = fwd
+    return out
+
+
+if mode == "snapshot":
+    lb = load(sys.argv[2])
+    attrs = load(sys.argv[3]) or []
+    tags = load(sys.argv[4]) or []
+    pairs = jsonl(sys.argv[5])
+
+    listeners = []
+    for pair in pairs:
+        lsn = pair["listener"]
+        rules = []
+        for rule in pair.get("rules") or []:
+            if rule.get("IsDefault"):
+                continue
+            rules.append({
+                "priority": rule["Priority"],
+                "conditions": [trim_condition(c) for c in rule.get("Conditions") or []],
+                "actions": [trim_action(a) for a in rule.get("Actions") or []],
+            })
+        entry = {
+            "port": lsn["Port"],
+            "protocol": lsn["Protocol"],
+            "defaultActions": [trim_action(a) for a in lsn.get("DefaultActions") or []],
+            "rules": sorted(rules, key=lambda r: int(r["priority"])),
+        }
+        if lsn.get("SslPolicy"):
+            entry["sslPolicy"] = lsn["SslPolicy"]
+        certs = [c["CertificateArn"] for c in lsn.get("Certificates") or []]
+        if certs:
+            entry["certificates"] = certs
+        listeners.append(entry)
+
+    print(json.dumps({
+        "alb": {
+            "name": lb["LoadBalancerName"],
+            "type": lb.get("Type", "application"),
+            "scheme": lb.get("Scheme"),
+            "ipAddressType": lb.get("IpAddressType", "ipv4"),
+            "vpcId": lb.get("VpcId"),
+            "subnets": sorted(z["SubnetId"] for z in lb.get("AvailabilityZones") or []),
+            "securityGroups": lb.get("SecurityGroups") or [],
+            "tags": {t["Key"]: t["Value"] for t in tags},
+            "attributes": [{"Key": a["Key"], "Value": a["Value"]} for a in attrs],
+            "previousDnsName": lb.get("DNSName"),
+            "previousCanonicalHostedZoneId": lb.get("CanonicalHostedZoneId"),
+            "previousArn": lb.get("LoadBalancerArn"),
+        },
+        "listeners": sorted(listeners, key=lambda l: l["port"]),
+    }, indent=2))
+
+elif mode == "dns_match":
+    # Records aimed at this load balancer, in one zone, in whatever account the
+    # caller pointed us at.
+    target = sys.argv[2].rstrip(".").lower()
+    profile, zone_id = sys.argv[3], sys.argv[4]
+    rrsets = load(sys.argv[5])
+    for rr in rrsets:
+        rtype = rr.get("Type")
+        alias = rr.get("AliasTarget") or {}
+        if alias:
+            adn = alias.get("DNSName", "").rstrip(".").lower()
+            if adn in (target, "dualstack." + target):
+                print(json.dumps({
+                    "profile": profile, "zoneId": zone_id, "name": rr["Name"],
+                    "type": rtype, "kind": "alias",
+                    "dualstack": adn.startswith("dualstack."),
+                    "eth": bool(alias.get("EvaluateTargetHealth")),
+                }))
+            continue
+        if rtype != "CNAME":
+            continue
+        values = [v.get("Value", "").rstrip(".").lower() for v in rr.get("ResourceRecords") or []]
+        if target in values:
+            print(json.dumps({
+                "profile": profile, "zoneId": zone_id, "name": rr["Name"],
+                "type": "CNAME", "kind": "cname", "ttl": rr.get("TTL", 300),
+            }))
+
+elif mode == "dns_change":
+    # One Route53 change batch, aiming a recorded record at wherever the load
+    # balancer landed this time. DELETE needs the value the record has NOW, so
+    # park passes the old name and unpark passes the new one.
+    rec = json.loads(sys.argv[2])
+    action, dns_name, zone_id = sys.argv[3], sys.argv[4], sys.argv[5]
+    rrs = {"Name": rec["name"], "Type": rec["type"]}
+    if rec["kind"] == "alias":
+        prefix = "dualstack." if rec.get("dualstack") else ""
+        rrs["AliasTarget"] = {
+            "HostedZoneId": zone_id,
+            "DNSName": prefix + dns_name,
+            "EvaluateTargetHealth": rec.get("eth", False),
+        }
+    else:
+        rrs["TTL"] = rec.get("ttl", 300)
+        rrs["ResourceRecords"] = [{"Value": dns_name}]
+    print(json.dumps({"Changes": [{"Action": action, "ResourceRecordSet": rrs}]}))
+
+elif mode == "blob":
+    # Assemble the stored parameter: the snapshot, plus the DNS records found
+    # and the profiles they were found through, so unpark needs no arguments.
+    snap = load(sys.argv[2])
+    records = jsonl(sys.argv[3]) if sys.argv[3] else []
+    snap["dns"] = records
+    snap["dnsProfiles"] = [p for p in sys.argv[4].split(",") if p]
+    if len(sys.argv) > 5 and sys.argv[5] == "1":
+        snap["alb"]["adopt"] = True
+    snap["parked_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    # Compact, not indented. A Standard SSM parameter stops at 4096 bytes and
+    # pretty-printing five listener rules spends 40% of that on whitespace; the
+    # `status` action pretty-prints on the way out, where it costs nothing.
+    print(json.dumps(snap, separators=(",", ":")))
+
+elif mode == "get":
+    # Pull one field out of the stored blob, as compact JSON or as a bare scalar.
+    blob = json.load(sys.stdin)
+    for key in sys.argv[2].split("."):
+        blob = blob.get(key) if isinstance(blob, dict) else None
+        if blob is None:
+            print("")
+            raise SystemExit
+    print(blob if isinstance(blob, str) else json.dumps(blob))
+
+elif mode == "iter":
+    # One compact JSON object per line, for a shell read loop.
+    blob = json.load(sys.stdin)
+    for item in blob.get(sys.argv[2]) or []:
+        print(json.dumps(item))
+
+elif mode == "attr_delta":
+    # Only the attributes that differ from what a freshly created load balancer
+    # already has. Diffing against the live default beats a hardcoded table that
+    # goes stale every time AWS adds an attribute.
+    want = {a["Key"]: a["Value"] for a in json.loads(sys.argv[2])}
+    have = {a["Key"]: a["Value"] for a in load(sys.argv[3])}
+    delta = [{"Key": k, "Value": v} for k, v in sorted(want.items()) if have.get(k) != v]
+    print(json.dumps(delta))
+
+elif mode == "listener_args":
+    # create-listener wants certificates and ssl-policy only for TLS listeners.
+    lsn = json.loads(sys.argv[2])
+    # `or ""` rather than a default: a plain HTTP listener records the key as
+    # null, and a default only fires on a missing key. Passing the string "None"
+    # to --ssl-policy is the failure that hides behind that distinction.
+    print(json.dumps({
+        "port": lsn["port"],
+        "protocol": lsn["protocol"],
+        "sslPolicy": lsn.get("sslPolicy") or "",
+        "certificates": ",".join("CertificateArn=" + c for c in lsn.get("certificates") or []),
+        "defaultActions": json.dumps(lsn["defaultActions"]),
+        "rules": json.dumps(lsn.get("rules") or []),
+    }))
+PYALB
+
+alb_discover() {
+  # The link from cluster to load balancer runs through the services' target
+  # groups. Asking the account for "the ALBs" would also sweep up ones this
+  # cluster has nothing to do with.
+  local tgs
+  tgs=$(aws ecs describe-services --cluster "$CLUSTER" --region "$REGION" --services "$@" \
+          --query 'services[].loadBalancers[].targetGroupArn' --output text 2>/dev/null \
+        | tr '\t' '\n' | grep -v '^$' | sort -u)
+  [ -z "$tgs" ] && return 0
+  # shellcheck disable=SC2086
+  aws elbv2 describe-target-groups --region "$REGION" --target-group-arns $tgs \
+      --query 'TargetGroups[].LoadBalancerArns[]' --output text 2>/dev/null \
+    | tr '\t' '\n' | grep -v '^$' | sort -u
+}
+
+alb_snapshot() {
+  local arn="$1"
+  aws elbv2 describe-load-balancers --region "$REGION" --load-balancer-arns "$arn" \
+      --query 'LoadBalancers[0]' --output json > "$TMP/lb.json"
+  aws elbv2 describe-load-balancer-attributes --region "$REGION" --load-balancer-arn "$arn" \
+      --query 'Attributes' --output json > "$TMP/lbattrs.json"
+  aws elbv2 describe-tags --region "$REGION" --resource-arns "$arn" \
+      --query 'TagDescriptions[0].Tags' --output json > "$TMP/lbtags.json"
+
+  : > "$TMP/lsn.jsonl"
+  aws elbv2 describe-listeners --region "$REGION" --load-balancer-arn "$arn" \
+      --query 'Listeners[].ListenerArn' --output text \
+    | tr '\t' '\n' | grep -v '^$' \
+    | while IFS= read -r L; do
+        aws elbv2 describe-listeners --region "$REGION" --listener-arns "$L" \
+            --query 'Listeners[0]' --output json > "$TMP/one-lsn.json"
+        aws elbv2 describe-rules --region "$REGION" --listener-arn "$L" \
+            --query 'Rules' --output json > "$TMP/one-rules.json"
+        python3 -c 'import json,sys
+print(json.dumps({"listener": json.load(open(sys.argv[1])), "rules": json.load(open(sys.argv[2]))}))' \
+          "$TMP/one-lsn.json" "$TMP/one-rules.json" >> "$TMP/lsn.jsonl"
+      done
+
+  # The web ACL is attached to the balancer, not described by it, so it dies with
+  # the balancer and a rebuild comes back unprotected. Record it to put it back.
+  local acl
+  acl=$(aws wafv2 get-web-acl-for-resource --region "$REGION" --resource-arn "$arn" \
+          --query 'WebACL.ARN' --output text 2>/dev/null) || acl=""
+  [ "$acl" = None ] && acl=""
+
+  python3 "$ALBHELPER" snapshot "$TMP/lb.json" "$TMP/lbattrs.json" "$TMP/lbtags.json" "$TMP/lsn.jsonl" \
+    | python3 -c 'import json,sys
+s = json.load(sys.stdin)
+if sys.argv[1]:
+    s["alb"]["webAclArn"] = sys.argv[1]
+print(json.dumps(s))' "$acl"
+}
+
+alb_dns_find() {
+  # Search every zone in every named profile for records aimed at this name. A
+  # zone in another account is reached with that account's profile, which is the
+  # whole reason the flag takes a list rather than a single zone id.
+  local dnsname="$1" p zones z
+  : > "$TMP/dns.jsonl"
+  for p in ${DNS_PROFILES//,/ }; do
+    # A profile that cannot list zones (expired SSO, a typo) must stop the park.
+    # Skipping it would record no DNS, and unpark would then leave the name aimed
+    # at a deleted balancer.
+    if ! zones=$(AWS_PROFILE="$p" aws route53 list-hosted-zones \
+              --query 'HostedZones[?Config.PrivateZone==`false`].Id' --output text); then
+      echo "cannot list Route53 zones with profile $p; fix it or drop it from --dns-profile" >&2
+      exit 1
+    fi
+    zones=$(printf '%s' "$zones" | tr '\t' '\n' | sed 's#/hostedzone/##' | grep -v '^$' || true)
+    for z in $zones; do
+      if ! AWS_PROFILE="$p" aws route53 list-resource-record-sets --hosted-zone-id "$z" \
+          --query 'ResourceRecordSets' --output json > "$TMP/rrsets.json"; then
+        echo "cannot read zone $z with profile $p" >&2
+        exit 1
+      fi
+      python3 "$ALBHELPER" dns_match "$dnsname" "$p" "$z" "$TMP/rrsets.json" >> "$TMP/dns.jsonl"
+    done
+  done
+}
+
+alb_dns_apply() {
+  # action is DELETE at park (against the name the record still holds) or UPSERT
+  # at unpark (against the name the rebuilt balancer just got).
+  local rec="$1" action="$2" dnsname="$3" zoneid="$4"
+  local prof name
+  prof=$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"])')
+  name=$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+  python3 "$ALBHELPER" dns_change "$rec" "$action" "$dnsname" "$zoneid" > "$TMP/change.json"
+  local dnserr
+  if dnserr=$(AWS_PROFILE="$prof" aws route53 change-resource-record-sets \
+       --hosted-zone-id "$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["zoneId"])')" \
+       --change-batch "file://$TMP/change.json" 2>&1 >/dev/null); then
+    echo "  ${action} ${name} via profile ${prof}"
+  else
+    echo "  WARNING: could not ${action} ${name} in profile ${prof}: ${dnserr}"
+  fi
+}
+
+alb_rule_create() {
+  local lsnarn="$1" rule="$2" prio ruleerr
+  printf '%s' "$rule" | python3 -c 'import json,sys
+sys.stdout.write(json.dumps(json.load(sys.stdin)["conditions"]))' > "$TMP/rule-cond.json"
+  printf '%s' "$rule" | python3 -c 'import json,sys
+sys.stdout.write(json.dumps(json.load(sys.stdin)["actions"]))' > "$TMP/rule-act.json"
+  prio=$(printf '%s' "$rule" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priority"])')
+  # Keep the API's own words. A rule that silently fails to restore is a
+  # route that quietly 404s later, and "did not restore" does not tell
+  # anyone whether the priority collided or the target group is gone.
+  if ruleerr=$(aws elbv2 create-rule --region "$REGION" --listener-arn "$lsnarn" \
+                 --priority "$prio" \
+                 --conditions "file://$TMP/rule-cond.json" \
+                 --actions "file://$TMP/rule-act.json" 2>&1 >/dev/null); then
+    echo "    rule priority $prio"
+  else
+    echo "    WARNING: rule priority $prio did not restore: $ruleerr"
+  fi
+}
+
+# The balancer Terraform built, found by the name park recorded. Prints its ARN,
+# or nothing when it does not exist.
+alb_adopt_arn() {
+  local name
+  name=$(printf '%s' "$1" | python3 "$ALBHELPER" get alb.name)
+  aws elbv2 describe-load-balancers --region "$REGION" --names "$name" \
+      --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || true
+}
+
+# Before unpark changes anything: the balancer and every recorded listener port
+# must already exist. Without them there is nothing to add rules to, and building
+# them here is the drift --alb-adopt exists to prevent.
+alb_adopt_check() {
+  local blob="$1" arn name port missing=""
+  name=$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.name)
+  arn=$(alb_adopt_arn "$blob")
+  if [ -z "$arn" ] || [ "$arn" = None ]; then
+    echo "park recorded that Terraform builds $name, and it does not exist yet." >&2
+    echo "Run the Terraform apply that builds it, then unpark again. Nothing was changed." >&2
+    exit 1
+  fi
+  aws elbv2 describe-listeners --region "$REGION" --load-balancer-arn "$arn" \
+      --query 'Listeners[].Port' --output text | tr '\t' '\n' | grep -v '^$' > "$TMP/live-ports.txt" || true
+  for port in $(printf '%s' "$blob" | python3 -c 'import json,sys
+for l in json.load(sys.stdin)["listeners"]: print(l["port"])'); do
+    grep -qx "$port" "$TMP/live-ports.txt" || missing="$missing $port"
+  done
+  if [ -n "$missing" ]; then
+    echo "$name exists but has no listener on port(s)$missing." >&2
+    echo "Run the Terraform apply that builds them, then unpark again. Nothing was changed." >&2
+    exit 1
+  fi
+  echo "found $name: $arn"
+}
+
+alb_adopt() {
+  local blob="$1" arn name newdns newzone acl liveacl
+  name=$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.name)
+  arn=$(alb_adopt_arn "$blob")
+  aws elbv2 wait load-balancer-available --region "$REGION" --load-balancer-arns "$arn"
+  echo "  adopted $name"
+
+  # Terraform owns the web ACL association. Only report a gap, because an
+  # association made here would be one more thing outside Terraform's state.
+  acl=$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.webAclArn)
+  if [ -n "$acl" ]; then
+    liveacl=$(aws wafv2 get-web-acl-for-resource --region "$REGION" --resource-arn "$arn" \
+                --query 'WebACL.ARN' --output text 2>/dev/null) || liveacl=""
+    if [ "$liveacl" = "$acl" ]; then
+      echo "  web ACL ${acl#*/webacl/} is attached"
+    else
+      echo "  WARNING: web ACL ${acl#*/webacl/} is not attached, the balancer is unprotected."
+      echo "           Terraform attaches it; check that the apply finished."
+    fi
+  fi
+
+  # Rules only. A priority already in use is a rule that is already there.
+  printf '%s' "$blob" | python3 "$ALBHELPER" iter listeners \
+  | while IFS= read -r lsn; do
+      local port lsnarn
+      port=$(printf '%s' "$lsn" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])')
+      lsnarn=$(aws elbv2 describe-listeners --region "$REGION" --load-balancer-arn "$arn" \
+                 --query "Listeners[?Port==\`$port\`].ListenerArn | [0]" --output text)
+      echo "  listener $port"
+      aws elbv2 describe-rules --region "$REGION" --listener-arn "$lsnarn" \
+          --query 'Rules[].Priority' --output text | tr '\t' '\n' > "$TMP/live-prios.txt"
+      printf '%s' "$lsn" | python3 -c 'import json,sys
+for r in json.load(sys.stdin).get("rules") or []: print(json.dumps(r))' \
+      | while IFS= read -r rule; do
+          local prio
+          prio=$(printf '%s' "$rule" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priority"])')
+          if grep -qx "$prio" "$TMP/live-prios.txt"; then
+            echo "    rule priority $prio is already there"
+          else
+            alb_rule_create "$lsnarn" "$rule"
+          fi
+        done
+    done
+
+  newdns=$(aws elbv2 describe-load-balancers --region "$REGION" --load-balancer-arns "$arn" \
+             --query 'LoadBalancers[0].DNSName' --output text)
+  newzone=$(aws elbv2 describe-load-balancers --region "$REGION" --load-balancer-arns "$arn" \
+              --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)
+  echo "  $name is at $newdns"
+
+  # Terraform writes some of these records itself. Write only the ones that are
+  # not aimed at the balancer yet, so a Terraform-owned record is never touched.
+  printf '%s' "$blob" | python3 "$ALBHELPER" iter dns \
+  | while IFS= read -r rec; do
+      local prof zone rname rtype
+      prof=$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["profile"])')
+      zone=$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["zoneId"])')
+      rname=$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+      rtype=$(printf '%s' "$rec" | python3 -c 'import json,sys; print(json.load(sys.stdin)["type"])')
+      if AWS_PROFILE="$prof" aws route53 list-resource-record-sets --hosted-zone-id "$zone" \
+           --start-record-name "$rname" --start-record-type "$rtype" --max-items 1 \
+           --query 'ResourceRecordSets' --output json > "$TMP/one-rrset.json" 2>/dev/null \
+         && python3 "$ALBHELPER" dns_match "$newdns" "$prof" "$zone" "$TMP/one-rrset.json" \
+              | python3 -c 'import json,sys
+want = sys.argv[1].rstrip(".").lower()
+sys.exit(0 if any(json.loads(l)["name"].rstrip(".").lower() == want for l in sys.stdin if l.strip()) else 1)' "$rname"; then
+        echo "  ${rname} is already aimed at the balancer"
+      else
+        alb_dns_apply "$rec" UPSERT "$newdns" "$newzone"
+      fi
+    done
+}
+
+alb_restore() {
+  local blob="$1" arn name newdns newzone lsn
+  name=$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.name)
+
+  local subnets sgs tagargs
+  subnets=$(printf '%s' "$blob" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["alb"]["subnets"]))')
+  sgs=$(printf '%s' "$blob" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["alb"]["securityGroups"]))')
+  tagargs=$(printf '%s' "$blob" | python3 -c 'import json,sys
+t = json.load(sys.stdin)["alb"].get("tags") or {}
+print(" ".join("Key={},Value={}".format(k, v) for k, v in sorted(t.items())))')
+
+  # shellcheck disable=SC2086
+  arn=$(aws elbv2 create-load-balancer --region "$REGION" \
+          --name "$name" \
+          --type "$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.type)" \
+          --scheme "$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.scheme)" \
+          --ip-address-type "$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.ipAddressType)" \
+          --subnets $subnets --security-groups $sgs \
+          ${tagargs:+--tags $tagargs} \
+          --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+  echo "  created $name"
+  aws elbv2 wait load-balancer-available --region "$REGION" --load-balancer-arns "$arn"
+
+  # Attributes only where they differ from what the fresh balancer already has.
+  aws elbv2 describe-load-balancer-attributes --region "$REGION" --load-balancer-arn "$arn" \
+      --query 'Attributes' --output json > "$TMP/fresh-attrs.json"
+  local delta
+  delta=$(python3 "$ALBHELPER" attr_delta \
+            "$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.attributes)" \
+            "$TMP/fresh-attrs.json")
+  if [ "$delta" != "[]" ]; then
+    printf '%s' "$delta" > "$TMP/attr-delta.json"
+    if aws elbv2 modify-load-balancer-attributes --region "$REGION" \
+         --load-balancer-arn "$arn" --attributes "file://$TMP/attr-delta.json" >/dev/null 2>&1; then
+      echo "  restored $(printf '%s' "$delta" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))') non-default attribute(s)"
+    else
+      echo "  WARNING: could not restore attributes: $delta"
+    fi
+  fi
+
+  # Before the listeners, so the balancer never serves a request unprotected.
+  # A balancer seconds old can be refused as WAFUnavailableEntity; retry that.
+  local acl aclerr
+  acl=$(printf '%s' "$blob" | python3 "$ALBHELPER" get alb.webAclArn)
+  if [ -n "$acl" ]; then
+    for _ in 1 2 3 4 5 6; do
+      if aclerr=$(aws wafv2 associate-web-acl --region "$REGION" \
+                    --web-acl-arn "$acl" --resource-arn "$arn" 2>&1 >/dev/null); then
+        echo "  attached web ACL ${acl#*/webacl/}"; aclerr=""; break
+      fi
+      sleep 10
+    done
+    [ -n "$aclerr" ] && echo "  WARNING: web ACL did not attach, the balancer is unprotected: $aclerr"
+  fi
+
+  printf '%s' "$blob" | python3 "$ALBHELPER" iter listeners \
+  | while IFS= read -r lsn; do
+      local args port proto ssl certs lsnarn
+      args=$(python3 "$ALBHELPER" listener_args "$lsn")
+      port=$(printf '%s' "$args" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])')
+      proto=$(printf '%s' "$args" | python3 -c 'import json,sys; print(json.load(sys.stdin)["protocol"])')
+      ssl=$(printf '%s' "$args" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sslPolicy"])')
+      certs=$(printf '%s' "$args" | python3 -c 'import json,sys; print(json.load(sys.stdin)["certificates"])')
+      printf '%s' "$args" | python3 -c 'import json,sys
+sys.stdout.write(json.load(sys.stdin)["defaultActions"])' > "$TMP/default-actions.json"
+
+      # shellcheck disable=SC2086
+      lsnarn=$(aws elbv2 create-listener --region "$REGION" \
+                 --load-balancer-arn "$arn" --protocol "$proto" --port "$port" \
+                 ${ssl:+--ssl-policy "$ssl"} ${certs:+--certificates $certs} \
+                 --default-actions "file://$TMP/default-actions.json" \
+                 --query 'Listeners[0].ListenerArn' --output text)
+      echo "  listener $proto:$port"
+
+      printf '%s' "$args" | python3 -c 'import json,sys
+for r in json.loads(json.load(sys.stdin)["rules"]):
+    print(json.dumps(r))' \
+      | while IFS= read -r rule; do
+          alb_rule_create "$lsnarn" "$rule"
+        done
+    done
+
+  newdns=$(aws elbv2 describe-load-balancers --region "$REGION" --load-balancer-arns "$arn" \
+             --query 'LoadBalancers[0].DNSName' --output text)
+  newzone=$(aws elbv2 describe-load-balancers --region "$REGION" --load-balancer-arns "$arn" \
+              --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)
+  echo "  $name is at $newdns"
+
+  printf '%s' "$blob" | python3 "$ALBHELPER" iter dns \
+  | while IFS= read -r rec; do
+      alb_dns_apply "$rec" UPSERT "$newdns" "$newzone"
+    done
+}
+
+HELPER="$TMP/helper.py"
+cat > "$HELPER" <<'PYHELPER'
+import json, sys, datetime
+
+mode = sys.argv[1]
+
+if mode == "collect":
+    nat = json.load(open(sys.argv[2]))
+    rtbs = json.load(open(sys.argv[3]))
+    if not nat or not nat.get("id"):
+        print(json.dumps({})); raise SystemExit
+    routes = []
+    for t in rtbs:
+        for entry in (t.get("routes") or []):
+            cidr, natid = entry[0], entry[1]
+            if natid == nat["id"]:
+                routes.append({"rtb": t["rtb"], "cidr": cidr})
+    nat["routes"] = routes
+    print(json.dumps(nat))
+
+elif mode == "nats_for_subnets":
+    # The route table that governs a subnet is the one explicitly associated with
+    # it, or else the VPC's main table.
+    tables = json.load(open(sys.argv[2]))["RouteTables"]
+    main = None
+    by_subnet = {}
+    for t in tables:
+        for a in t.get("Associations") or []:
+            if a.get("Main"):
+                main = t
+            elif a.get("SubnetId"):
+                by_subnet[a["SubnetId"]] = t
+    nats = set()
+    for subnet in sys.argv[3:]:
+        t = by_subnet.get(subnet, main)
+        if t is None:
+            continue
+        for r in t.get("Routes") or []:
+            if r.get("NatGatewayId"):
+                nats.add(r["NatGatewayId"])
+    for n in sorted(nats):
+        print(n)
+
+elif mode == "field":
+    print(json.load(sys.stdin)[sys.argv[2]])
+
+elif mode == "routes":
+    for r in json.load(sys.stdin).get("routes", []):
+        print(r["rtb"], r["cidr"])
+
+elif mode == "blob":
+    svcs = json.load(sys.stdin)
+    running = {s["service"]: s["desired"] for s in svcs if s["desired"] > 0}
+
+    # Merge onto any state already recorded rather than replacing it. Parking a
+    # cluster that is already parked sees nothing running, and a naive overwrite
+    # would replace the counts that make unpark possible with an empty map. That
+    # is the one way this tool could lose the thing it exists to protect, so the
+    # earlier record always wins for a service the new snapshot cannot see.
+    prior_path = sys.argv[5] if len(sys.argv) > 5 else ""
+    prior = {}
+    if prior_path:
+        try:
+            prior = json.load(open(prior_path))
+        except (OSError, ValueError):
+            prior = {}
+    merged = dict(prior.get("services") or {})
+    merged.update(running)
+
+    out = {
+        "cluster": sys.argv[2],
+        "region": sys.argv[3],
+        "parked_at": prior.get("parked_at")
+            or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "services": merged,
+    }
+    nat_path = sys.argv[4] if len(sys.argv) > 4 else ""
+    if nat_path:
+        nat = json.load(open(nat_path))
+        if nat:
+            out["nat"] = nat
+    elif prior.get("nat"):
+        out["nat"] = prior["nat"]
+    print(json.dumps(out, indent=2))
+
+elif mode == "count":
+    print(len(json.load(sys.stdin)["services"]))
+
+elif mode == "keys":
+    for k in json.load(sys.stdin)["services"]:
+        print(k)
+
+elif mode == "pairs":
+    for k, v in json.load(sys.stdin)["services"].items():
+        print(k, v)
+
+elif mode == "nat_of":
+    d = json.load(sys.stdin).get("nat")
+    print(json.dumps(d) if d else "")
+PYHELPER
+
+case "$ACTION" in
+
+status)
+  SVC=()
+  while IFS= read -r line; do SVC+=("$line"); done < <(list_services)
+  if [ "${#SVC[@]}" -eq 0 ]; then echo "no services in $CLUSTER"; exit 0; fi
+  echo "live services in $CLUSTER:"
+  describe_services "${SVC[@]}" | python3 -c 'import json,sys
+for s in sorted(json.load(sys.stdin), key=lambda x: x["service"]):
+    print("  {:<36} desired={} running={}".format(s["service"], s["desired"], s["running"]))'
+  echo
+  if STATE=$(read_state); then
+    echo "park state recorded at $PARAM:"
+    printf '%s\n' "$STATE" | python3 -m json.tool | sed 's/^/  /'
+    if printf '%s' "$STATE" | python3 "$HELPER" nat_of | grep -q .; then
+      echo
+      echo "  WARNING: the NAT gateway is torn down. The private subnets have no"
+      echo "  egress, so a one-off task launched there will fail to pull its image."
+      echo "  Run unpark to rebuild it before running anything in this VPC."
+    fi
+  else
+    echo "no park state at $PARAM (not parked by this tool)"
+  fi
+  if ALBSTATE=$(aws ssm get-parameter --name "$ALB_PARAM" --region "$REGION" \
+                  --query 'Parameter.Value' --output text 2>/dev/null); then
+    echo
+    echo "load balancer state recorded at $ALB_PARAM:"
+    printf '%s\n' "$ALBSTATE" | python3 -m json.tool | sed 's/^/  /'
+  fi
+  ;;
+
+park)
+  SVC=()
+  if [ -n "$ONLY" ]; then
+    IFS=',' read -r -a SVC <<< "$ONLY"
+  else
+    while IFS= read -r line; do SVC+=("$line"); done < <(list_services)
+  fi
+  if [ "${#SVC[@]}" -eq 0 ]; then echo "no services to park"; exit 0; fi
+
+  NAT_ARG=""
+  if [ "$WITH_NAT" -eq 1 ]; then
+    nat_snapshot "${SVC[@]}" > "$TMP/nat-snap.json"
+    if [ -s "$TMP/nat-snap.json" ] && [ "$(cat "$TMP/nat-snap.json")" != "{}" ]; then
+      NAT_ARG="$TMP/nat-snap.json"
+    else
+      echo "the selected services route through no available NAT gateway; parking services only"
+    fi
+  fi
+
+  ALBBLOB=""
+  if [ "$WITH_ALB" -eq 1 ]; then
+    ALB_ARNS=$(alb_discover "${SVC[@]}")
+    if [ -z "$ALB_ARNS" ]; then
+      echo "no load balancer reachable from the selected services; parking services only"
+    elif [ "$(printf '%s\n' "$ALB_ARNS" | wc -l | tr -d ' ')" -gt 1 ]; then
+      # Recording one and deleting all of them would be the worst outcome here.
+      echo "the selected services span more than one load balancer:" >&2
+      printf '  %s\n' $ALB_ARNS >&2
+      echo "narrow the park with --only, or park them in separate runs" >&2
+      exit 1
+    else
+      SNAP=$(alb_snapshot "$ALB_ARNS")
+      printf '%s' "$SNAP" > "$TMP/alb-snap.json"
+      OLDDNS=$(printf '%s' "$SNAP" | python3 "$ALBHELPER" get alb.previousDnsName)
+      alb_dns_find "$OLDDNS"
+      if [ ! -s "$TMP/dns.jsonl" ] && [ "$NO_DNS" != 1 ]; then
+        echo "no Route53 record in profile(s) ${DNS_PROFILES:-$PROFILE} points at $OLDDNS" >&2
+        echo "pass the --dns-profile of the account that holds the zone," >&2
+        echo "or --no-dns if this balancer has no public name" >&2
+        exit 1
+      fi
+      ALBBLOB=$(python3 "$ALBHELPER" blob "$TMP/alb-snap.json" "$TMP/dns.jsonl" "${DNS_PROFILES:-$PROFILE}" "$ALB_ADOPT")
+    fi
+  fi
+
+  PRIOR=""
+  if read_state > "$TMP/prior.json" 2>/dev/null && [ -s "$TMP/prior.json" ]; then
+    PRIOR="$TMP/prior.json"
+  fi
+  BLOB=$(describe_services "${SVC[@]}" | python3 "$HELPER" blob "$CLUSTER" "$REGION" "$NAT_ARG" "$PRIOR")
+  COUNT=$(printf '%s' "$BLOB" | python3 "$HELPER" count)
+  PRE_NAT=$(printf '%s' "$BLOB" | python3 "$HELPER" nat_of)
+  if [ "$ALB_ONLY" = 1 ]; then
+    # The services were still read, because they are how the load balancer was
+    # found. Nothing is recorded or scaled for them.
+    if [ -z "$ALBBLOB" ]; then
+      echo "no load balancer to park"
+      exit 0
+    fi
+  elif [ "$COUNT" -eq 0 ] && [ -z "$PRE_NAT" ] && [ -z "$ALBBLOB" ]; then
+    # An already-parked cluster still has NAT and ALB work to do, so only bail
+    # when there is nothing left on any front.
+    echo "every selected service is already at 0, and there is no NAT or load balancer to tear down"
+    exit 0
+  fi
+
+  if [ "$ALB_ONLY" != 1 ]; then
+    echo "recording $COUNT service(s) to $PARAM:"
+    printf '%s\n' "$BLOB" | sed 's/^/  /'
+  fi
+  if [ -n "$ALBBLOB" ]; then
+    echo
+    echo "recording the load balancer to $ALB_PARAM:"
+    printf '%s\n' "$ALBBLOB" | python3 -m json.tool | sed 's/^/  /'
+  fi
+  if [ "$DRY" -eq 1 ]; then echo "(dry run, nothing written or scaled)"; exit 0; fi
+
+  # Record BEFORE changing anything. A crash between the two leaves a restorable
+  # state; the reverse order leaves resources gone with no memory of them.
+  if [ "$ALB_ONLY" != 1 ]; then
+    aws ssm put-parameter --name "$PARAM" --region "$REGION" \
+        --type String --overwrite --value "$BLOB" >/dev/null
+  fi
+  if [ -n "$ALBBLOB" ]; then
+    aws ssm put-parameter --name "$ALB_PARAM" --region "$REGION" \
+        --type String --overwrite --value "$ALBBLOB" >/dev/null
+  fi
+  echo "recorded."
+
+  if [ "$ALB_ONLY" != 1 ]; then
+    printf '%s' "$BLOB" | python3 "$HELPER" keys \
+    | while IFS= read -r S; do
+        aws ecs update-service --cluster "$CLUSTER" --region "$REGION" \
+            --service "$S" --desired-count 0 >/dev/null
+        echo "  parked $S -> 0"
+      done
+  fi
+
+  # Load balancer after the services: deleting it under a running service just
+  # 503s whatever is still pointed at it.
+  if [ -n "$ALBBLOB" ]; then
+    OLDDNS=$(printf '%s' "$ALBBLOB" | python3 "$ALBHELPER" get alb.previousDnsName)
+    OLDZONE=$(printf '%s' "$ALBBLOB" | python3 "$ALBHELPER" get alb.previousCanonicalHostedZoneId)
+    # DNS before the balancer, so a failure here never leaves a record aimed at
+    # a hostname the account has already given up.
+    printf '%s' "$ALBBLOB" | python3 "$ALBHELPER" iter dns \
+    | while IFS= read -r REC; do
+        alb_dns_apply "$REC" DELETE "$OLDDNS" "$OLDZONE"
+      done
+    ALBARN=$(printf '%s' "$ALBBLOB" | python3 "$ALBHELPER" get alb.previousArn)
+    # Deletion protection guards against deleting by mistake; this delete is on
+    # purpose. The snapshot already holds the attribute as it was, so unpark turns
+    # protection back on with the other non-default attributes.
+    aws elbv2 modify-load-balancer-attributes --region "$REGION" --load-balancer-arn "$ALBARN" \
+        --attributes Key=deletion_protection.enabled,Value=false >/dev/null
+    aws elbv2 delete-load-balancer --region "$REGION" --load-balancer-arn "$ALBARN"
+    echo "  deleted load balancer $(printf '%s' "$ALBBLOB" | python3 "$ALBHELPER" get alb.name)"
+  fi
+
+  # NAT last on the way down: services stop needing egress before it disappears.
+  #
+  # Tear down only a gateway THIS run saw live. The blob merges whatever an
+  # earlier park recorded, so an already-parked cluster still carries its NAT
+  # entry long after the gateway is gone -- reading the teardown target out of
+  # the merged blob makes every repeat park fail on NatGatewayNotFound.
+  NATBLOB=""
+  if [ "$ALB_ONLY" != 1 ] && [ -n "$NAT_ARG" ]; then
+    NATBLOB=$(printf '%s' "$BLOB" | python3 "$HELPER" nat_of)
+  fi
+  if [ -n "$NATBLOB" ]; then
+    nat_delete "$(printf '%s' "$NATBLOB" | python3 "$HELPER" field id)" \
+               "$(printf '%s' "$NATBLOB" | python3 "$HELPER" field alloc)"
+  fi
+  ;;
+
+unpark)
+  ALBSTATE=$(aws ssm get-parameter --name "$ALB_PARAM" --region "$REGION" \
+               --query 'Parameter.Value' --output text 2>/dev/null) || ALBSTATE=""
+  if [ "$ALB_ONLY" = 1 ]; then
+    if [ -z "$ALBSTATE" ]; then
+      echo "no load balancer state at $ALB_PARAM" >&2
+      exit 1
+    fi
+    STATE='{"services":{}}'
+  elif ! STATE=$(read_state); then
+    if [ -z "$ALBSTATE" ]; then
+      echo "no park state at $PARAM; refusing to guess desired counts" >&2
+      exit 1
+    fi
+    # A load-balancer-only park is a legitimate state to come back from.
+    STATE='{"services":{}}'
+    echo "no service state at $PARAM; restoring the load balancer only"
+  fi
+  if [ "$ALB_ONLY" != 1 ]; then
+    echo "restoring from $PARAM:"
+    printf '%s\n' "$STATE" | sed 's/^/  /'
+  fi
+  ADOPT=0
+  if [ -n "$ALBSTATE" ]; then
+    echo
+    echo "restoring the load balancer from $ALB_PARAM:"
+    printf '%s\n' "$ALBSTATE" | python3 -m json.tool | sed 's/^/  /'
+    if [ "$(printf '%s' "$ALBSTATE" | python3 "$ALBHELPER" get alb.adopt)" = true ]; then
+      ADOPT=1
+      # Read-only, and before the dry-run exit, so a dry run proves it too.
+      alb_adopt_check "$ALBSTATE"
+    fi
+  fi
+  if [ "$DRY" -eq 1 ]; then echo "(dry run, nothing scaled)"; exit 0; fi
+
+  # NAT first on the way up. Tasks in private subnets pull images through it, so
+  # scaling before it is available produces a crash loop rather than an error.
+  NATBLOB=$(printf '%s' "$STATE" | python3 "$HELPER" nat_of)
+  if [ -n "$NATBLOB" ]; then
+    nat_restore "$NATBLOB"
+  fi
+
+  # Then the balancer, so the first task to pass its health check is registering
+  # into a target group something is already listening in front of.
+  if [ -n "$ALBSTATE" ]; then
+    if [ "$ADOPT" = 1 ]; then
+      alb_adopt "$ALBSTATE"
+    else
+      alb_restore "$ALBSTATE"
+    fi
+    aws ssm delete-parameter --name "$ALB_PARAM" --region "$REGION" >/dev/null 2>&1 || true
+  fi
+
+  printf '%s' "$STATE" | python3 "$HELPER" pairs \
+  | while IFS=" " read -r S N; do
+      aws ecs update-service --cluster "$CLUSTER" --region "$REGION" \
+          --service "$S" --desired-count "$N" >/dev/null
+      echo "  restored $S -> $N"
+    done
+  # Only clear the service state when the services were actually restored.
+  # Deleting it after an --alb-only unpark would throw away the desired counts
+  # that are the whole reason this tool exists.
+  if [ "$ALB_ONLY" != 1 ]; then
+    aws ssm delete-parameter --name "$PARAM" --region "$REGION" >/dev/null 2>&1 || true
+    echo "park state cleared."
+  else
+    echo "service park state at $PARAM left in place."
+  fi
+  ;;
+esac
