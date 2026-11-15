@@ -1048,7 +1048,7 @@ park)
   fi
   if [ -n "$ALBBLOB" ]; then
     aws ssm put-parameter --name "$ALB_PARAM" --region "$REGION" \
-        --type String --overwrite --value "$ALBBLOB" >/dev/null
+        --type String --tier Intelligent-Tiering --overwrite --value "$ALBBLOB" >/dev/null
   fi
   echo "recorded."
 

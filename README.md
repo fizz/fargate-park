@@ -50,7 +50,7 @@ Unpark brings the NAT gateway up before any service scales. Fargate tasks in pri
 
 An idle Application Load Balancer costs about $16 to $22 a month and cannot scale to zero, so park deletes it and unpark builds it again from the record.
 
-The record holds what dies with the load balancer: its attributes, listeners, listener rules, deletion protection, and the WAF web ACL associated with it. Target groups, security groups, subnets and certificates survive the delete and are not recorded. The record goes in its own parameter, `/fargate-park/<cluster>-alb`, because a Standard SSM parameter holds 4096 bytes and the rules use most of that.
+The record holds what dies with the load balancer: its attributes, listeners, listener rules, deletion protection, and the WAF web ACL associated with it. Target groups, security groups, subnets and certificates survive the delete and are not recorded. The record goes in its own parameter, `/fargate-park/<cluster>-alb`, because a Standard SSM parameter holds 4096 characters and the rules use most of that. The write uses `--tier Intelligent-Tiering`, so a record that passes 4096 is stored as an Advanced parameter (8 KB) and a smaller one stays Standard.
 
 ### DNS
 
